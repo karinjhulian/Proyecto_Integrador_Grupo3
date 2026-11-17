@@ -1,0 +1,548 @@
+---
+title: "Proyecto Integrador – Fase 3: Modelización empresarial"
+subtitle: "Modelo de regresión de las unidades vendidas según el descuento (2016–2022)"
+author: "Grupo 3: Rocha Karin, Raña Sebastián, Lecoña Camila"
+date: "`r format(Sys.Date(), '%d/%m/%Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.align = "center", fig.width = 8, fig.height = 4.5)
+options(scipen = 999, digits = 6)
+
+# Valor p para el texto: "< 0.001" o "= 0.123"
+fp <- function(p) ifelse(p < 0.001, "< 0.001", paste0("= ", sprintf("%.3f", p)))
+# Redondeo sin mostrar "-0.00"
+r2 <- function(x, d = 2) format(round(x, d) + 0, nsmall = d)
+```
+
+# Planteamiento
+
+## Problema y objetivo del modelo
+
+**Problema central:** determinar si los descuentos promocionales generan un aumento de ventas suficiente para compensar los ingresos cedidos al otorgarlos.
+
+**Qué resultado se mide.** El objetivo del proyecto habla de maximizar el **ingreso neto**, pero un modelo de regresión necesita una variable respuesta concreta. En este modelo la respuesta es la **cantidad de unidades vendidas**, porque es lo que el descuento debería hacer subir. El ingreso neto se calcula después, a partir de las unidades que predice el modelo, en la sección de escenarios.
+
+**Por qué no se modela la rentabilidad ni el margen de contribución.** Esas medidas requieren costos fiables y una función de beneficio definida, y la base de datos no tiene costos. Por eso se trabaja con unidades e ingreso neto, y el margen se deja como extensión (sección 9).
+
+**Sobre la causalidad.** Una asociación entre descuento y unidades no demuestra por sí sola que el descuento *cause* las ventas. Los coeficientes se interpretan como **asociaciones** manteniendo las demás variables constantes.
+
+## Unidad de observación y variables
+
+La unidad de observación es la **línea de orden** (un producto dentro de una orden), que es el grano de la tabla de hechos `FACT_VENTAS`. Tiene 274,566 observaciones. Como verificación se estima también un modelo semanal, donde la unidad es la **semana** (observación $t$ de una serie de tiempo).
+
+| Símbolo | Variable | Unidad de medida | Cómo se obtiene |
+|---|---|---|---|
+| Q | Unidades vendidas | unidades por línea (1 a 10) | `quantity` |
+| D | Descuento | puntos porcentuales (0 a 25) | `discount × 100` |
+| P | Precio de referencia | moneda de la base, por unidad, **antes** del descuento | `subtotal / quantity` |
+| C | Indicador de campaña | 1 = línea de una orden con campaña, 0 = sin campaña | `campaña_key ≠ −1` |
+
+## Modelos
+
+**Modelo principal: regresión múltiple por MCO (mínimos cuadrados ordinarios).**
+
+```
+Q = β0 + β1·D + β2·P + β3·C + u
+```
+
+β1 es la asociación entre un punto porcentual más de descuento y las unidades vendidas, manteniendo constantes el precio y la campaña. β3 es la diferencia de unidades entre una línea con campaña y una sin campaña a igual descuento. Como D vale 0 cuando no hay campaña, ambas variables están relacionadas, y por eso se revisa la multicolinealidad más adelante.
+
+**Modelo complementario: regresión log-log.**
+
+```
+ln(Q) = β0 + β1·ln(D) + u
+```
+
+β1 es la **elasticidad** de las unidades respecto del descuento. Esta forma exige D > 0, pero las líneas sin campaña tienen D = 0 y `ln(0)` no existe. Por eso se estima **solo con las líneas con campaña** (D entre 5 y 25), que es donde el descuento varía y donde la elasticidad tiene sentido.
+
+# Datos
+
+El modelo parte del Data Warehouse de la Fase 2 (`MarketingDW`). R se conecta directamente a SQL Server. La fecha exacta de la orden solo se necesita para el modelo semanal y se lee de la base transaccional `MarketingOLTP`.
+
+```{r paquetes}
+paquetes <- c("dplyr", "tidyr", "ggplot2", "lubridate", "scales", "broom", "knitr",
+              "lmtest", "sandwich", "DBI", "odbc")
+faltan <- paquetes[!paquetes %in% rownames(installed.packages())]
+if (length(faltan) > 0) install.packages(faltan, repos = "https://packagemanager.posit.co/cran/2022-04-01")
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(lubridate)
+library(scales)
+library(broom)
+library(knitr)
+library(lmtest)
+library(sandwich)
+library(DBI)
+```
+
+## Conexión y lectura
+
+```{r conexion}
+servidor <- "T003-Fila2-12"   # nombre del servidor SQL Server (el mismo que aparece en SSMS)
+
+drivers <- unique(odbc::odbcListDrivers()$name)
+driver  <- intersect(c("SQL Server Native Client 11.0", "ODBC Driver 17 for SQL Server",
+                       "ODBC Driver 13 for SQL Server", "SQL Server"), drivers)[1]
+if (is.na(driver)) stop("No se encontró un driver ODBC de SQL Server en este equipo.")
+
+conectar <- function(base) {
+  dbConnect(odbc::odbc(), Driver = driver, Server = servidor,
+            Database = base, Trusted_Connection = "Yes")
+}
+
+con_dw   <- conectar("MarketingDW")
+con_oltp <- conectar("MarketingOLTP")
+```
+
+```{r lectura}
+fact      <- dbGetQuery(con_dw, "SELECT * FROM FACT_VENTAS")
+productos <- dbGetQuery(con_dw, "SELECT producto_key, category_name FROM DIM_PRODUCTO")
+tiempo    <- dbGetQuery(con_dw, "SELECT * FROM DIM_TIEMPO")
+orders    <- dbGetQuery(con_oltp, "SELECT order_id, order_date FROM orders")
+orders$order_date <- as.Date(orders$order_date)
+
+# Las columnas con ñ se renombran para evitar problemas de codificación
+names(fact)[grepl("^campa.{1,3}a_key$", names(fact))] <- "campana_key"
+names(tiempo)[grepl("^a.{1,3}o$", names(tiempo))]     <- "anio"
+```
+
+## Tabla de análisis
+
+```{r tablas}
+lineas <- fact %>%
+  inner_join(productos, by = "producto_key") %>%
+  inner_join(select(tiempo, tiempo_key, anio, mes), by = "tiempo_key") %>%
+  mutate(Q = quantity,
+         D = discount * 100,
+         P = subtotal / quantity,
+         C = as.integer(campana_key != -1))
+
+nrow(lineas)
+```
+
+# Revisión previa de los datos
+
+Antes de definir el modelo se comprueba que haya **variación suficiente** en descuentos, precios, productos y períodos: sin variación, los coeficientes no se pueden estimar con precisión.
+
+## Variación de las variables del modelo
+
+```{r variacion}
+resumir <- function(x, nombre, unidad) {
+  tibble(Variable = nombre, Unidad = unidad, Mínimo = min(x), Mediana = median(x),
+         Media = mean(x), Máximo = max(x), `Desv. estándar` = sd(x), `Valores distintos` = n_distinct(x))
+}
+con_desc <- filter(lineas, D > 0)
+
+kable(bind_rows(
+  resumir(lineas$Q, "Q: unidades por línea", "unidades"),
+  resumir(lineas$D, "D: descuento (todas las líneas)", "puntos %"),
+  resumir(con_desc$D, "D: descuento (solo con campaña)", "puntos %"),
+  resumir(lineas$P, "P: precio de referencia", "moneda")), digits = 2)
+
+prop_camp <- mean(lineas$C)
+```
+
+```{r grafico_descuento}
+ggplot(con_desc, aes(x = round(D))) +
+  geom_bar(fill = "#2C5F8A", color = "white") +
+  labs(x = "Descuento (puntos porcentuales)", y = "Líneas con campaña",
+       title = "Distribución del descuento en las líneas con campaña") +
+  theme_minimal()
+```
+
+**Lectura.** El `r percent(1 - prop_camp, accuracy = 0.1)` de las líneas no tiene descuento y el `r percent(prop_camp, accuracy = 0.1)` tiene descuentos enteros entre `r min(con_desc$D)` y `r max(con_desc$D)` puntos, repartidos de forma bastante pareja (los extremos de 5 y 25 puntos tienen cerca de la mitad de líneas que los demás niveles). Hay variación suficiente de descuento *dentro del rango de 5 a 25 puntos*, y no existen descuentos fuera de ese rango: el modelo **no permite extrapolar** a descuentos mayores de 25 %. El precio varía entre `r round(min(lineas$P))` y `r round(max(lineas$P))`, y las unidades entre 1 y 10, de modo que también hay variación en ambas.
+
+## Variación entre productos y períodos
+
+Se revisa si las campañas están repartidas de forma pareja entre categorías y años (si no lo estuvieran, el efecto del descuento se confundiría con la categoría o con el año) y si las unidades cambian entre ellos.
+
+```{r categorias_periodos}
+por_cat <- lineas %>%
+  group_by(category_name) %>%
+  summarise(`% líneas con campaña` = 100 * mean(C), `Unidades medias` = mean(Q), `Precio medio` = mean(P)) %>%
+  arrange(desc(`% líneas con campaña`))
+
+por_anio <- lineas %>%
+  group_by(anio) %>%
+  summarise(`% líneas con campaña` = 100 * mean(C), `Unidades medias` = mean(Q), `Precio medio` = mean(P))
+
+kable(mutate(por_anio, anio = as.character(anio)), digits = 2)
+
+ggplot(por_cat, aes(x = reorder(category_name, `% líneas con campaña`), y = `% líneas con campaña`)) +
+  geom_col(fill = "#2C5F8A") +
+  coord_flip() +
+  labs(x = NULL, y = "% de líneas con campaña", title = "Proporción de líneas con campaña por categoría") +
+  theme_minimal()
+
+kw_cat  <- kruskal.test(Q ~ factor(category_name), data = lineas)
+kw_anio <- kruskal.test(Q ~ factor(anio), data = lineas)
+kw_mes  <- kruskal.test(Q ~ factor(mes), data = lineas)
+```
+
+**Lectura.** La proporción de líneas con campaña va de `r r2(min(por_cat$"% líneas con campaña"), 1)` % a `r r2(max(por_cat$"% líneas con campaña"), 1)` % entre categorías y de `r r2(min(por_anio$"% líneas con campaña"), 1)` % a `r r2(max(por_anio$"% líneas con campaña"), 1)` % entre años: las campañas están repartidas de manera similar. Las unidades por línea no difieren entre categorías (Kruskal-Wallis, p `r fp(kw_cat$p.value)`), años (p `r fp(kw_anio$p.value)`) ni meses (p `r fp(kw_mes$p.value)`). Por lo tanto el modelo principal puede mantenerse simple, y **como comprobación de robustez** se estima también una versión que controla categoría, año y mes (sección 4.2), que es la forma de respetar la precaución sobre cambios temporales y diferencias entre categorías.
+
+# Modelo principal: regresión múltiple por MCO
+
+## Especificación propuesta
+
+```{r modelo1}
+m1 <- lm(Q ~ D + P + C, data = lineas)
+
+# Errores estándar robustos, agrupados por orden: las líneas de una misma orden comparten
+# la campaña y pueden estar relacionadas, así que no se tratan como independientes
+V1 <- vcovCL(m1, cluster = lineas$order_id, type = "HC1")
+
+nombres <- c("(Intercept)" = "Constante", "D" = "Descuento (por punto %)",
+             "P" = "Precio de referencia (por unidad monetaria)", "C" = "Campaña (1 = sí)")
+
+tabla_coef <- function(m, V, terminos = NULL) {
+  est <- coef(m)
+  ee  <- sqrt(diag(V))
+  z   <- est / ee
+  p   <- 2 * pt(-abs(z), df = df.residual(m))
+  q   <- qt(0.975, df.residual(m))
+  out <- tibble(Término = names(est), Coeficiente = est, `Error estándar` = ee,
+                `IC 95% inf` = est - q * ee, `IC 95% sup` = est + q * ee, `Valor p` = p)
+  if (!is.null(terminos)) out <- filter(out, Término %in% terminos)
+  mutate(out, Término = ifelse(Término %in% names(nombres), nombres[Término], Término))
+}
+
+kable(mutate(tabla_coef(m1, V1), `Valor p` = ifelse(`Valor p` < 0.001, "< 0.001", sprintf("%.3f", `Valor p`))),
+      digits = 5)
+```
+
+```{r modelo1_resumen}
+r2_m1  <- summary(m1)$r.squared
+f_m1   <- summary(m1)$fstatistic
+p_f_m1 <- pf(f_m1[1], f_m1[2], f_m1[3], lower.tail = FALSE)
+
+# ¿Importa el descuento en conjunto (D y C a la vez)? Prueba de Wald con errores robustos
+m0 <- lm(Q ~ P, data = lineas)
+w_dc <- waldtest(m1, m0, vcov = function(x) vcovCL(x, cluster = lineas$order_id, type = "HC1"))
+p_dc <- w_dc$`Pr(>F)`[2]
+
+b <- tabla_coef(m1, V1)
+b_D <- b[b$Término == "Descuento (por punto %)", ]
+b_C <- b[b$Término == "Campaña (1 = sí)", ]
+```
+
+**Interpretación.**
+
+- **Descuento (β1).** Cada punto porcentual más de descuento se asocia con un cambio de `r r2(b_D$Coeficiente, 4)` unidades por línea (IC 95 %: `r r2(b_D$"IC 95% inf", 4)` a `r r2(b_D$"IC 95% sup", 4)`; p `r fp(b_D$"Valor p")`). Para 10 puntos más de descuento, el cambio sería de `r r2(10 * b_D$Coeficiente, 3)` unidades (`r r2(10 * b_D$"IC 95% inf", 3)` a `r r2(10 * b_D$"IC 95% sup", 3)`), frente a una media de 5.5 unidades por línea. El intervalo incluye el cero y es muy estrecho: el descuento **no está asociado** con más unidades.
+- **Campaña (β3).** A igual descuento y precio, una línea con campaña tiene `r r2(b_C$Coeficiente, 3)` unidades de diferencia respecto de una sin campaña (IC 95 %: `r r2(b_C$"IC 95% inf", 3)` a `r r2(b_C$"IC 95% sup", 3)`; p `r fp(b_C$"Valor p")`).
+- **Prueba conjunta de descuento y campaña.** Contrasta si D y C juntas aportan algo al modelo: p `r fp(p_dc)`. `r ifelse(p_dc < 0.05, "Sí aportan.", "No aportan: el descuento y la campaña, juntos, no explican las unidades.")`
+- **Ajuste.** R² = `r sprintf("%.6f", r2_m1)` (es decir, `r sprintf("%.4f", 100 * r2_m1)` % de la variación) y la prueba F global tiene p `r fp(p_f_m1)`. El modelo no explica las unidades vendidas con estas variables.
+
+## Comprobación de robustez: con controles de categoría, año y mes
+
+```{r modelo1b}
+m1b <- lm(Q ~ D + P + C + category_name + factor(anio) + factor(mes), data = lineas)
+V1b <- vcovCL(m1b, cluster = lineas$order_id, type = "HC1")
+
+tb <- tabla_coef(m1b, V1b, terminos = c("D", "P", "C"))
+tb$Modelo <- "Con controles"
+ta <- b
+ta$Modelo <- "Principal"
+comp <- bind_rows(ta, tb) %>%
+  filter(Término != "Constante") %>%
+  mutate(`Valor p` = ifelse(`Valor p` < 0.001, "< 0.001", sprintf("%.3f", `Valor p`))) %>%
+  select(Modelo, everything())
+kable(comp, digits = 5)
+
+kable(tibble(Modelo = c("Principal", "Con controles"),
+             `R²` = c(summary(m1)$r.squared, summary(m1b)$r.squared),
+             `R² ajustado` = c(summary(m1)$adj.r.squared, summary(m1b)$adj.r.squared)), digits = 6)
+```
+
+**Interpretación.** Al controlar categoría, año y mes, los coeficientes del descuento y de la campaña casi no cambian y siguen sin ser significativos. La conclusión no depende de la especificación elegida.
+
+# Supuestos del modelo
+
+```{r supuestos}
+bp    <- bptest(m1)
+reset <- resettest(m1, power = 2:3, type = "fitted")
+
+# Factor de inflación de la varianza (VIF): 1 / (1 - R² de regresar cada variable contra las demás)
+X <- model.matrix(m1)[, -1]
+vif <- sapply(colnames(X), function(v) 1 / (1 - summary(lm(X[, v] ~ X[, colnames(X) != v]))$r.squared))
+r_DC <- cor(lineas$D, lineas$C)
+
+kable(tibble(Supuesto = c("Linealidad (RESET)", "Varianza constante (Breusch-Pagan)"),
+             Estadístico = c(unname(reset$statistic), unname(bp$statistic)),
+             `Valor p` = c(reset$p.value, bp$p.value)), digits = 3)
+kable(tibble(Variable = names(vif), VIF = as.numeric(vif)), digits = 2)
+```
+
+```{r grafico_residuos}
+set.seed(123)
+aug <- data.frame(ajustado = fitted(m1), residuo = resid(m1)) %>% slice_sample(n = 5000)
+
+ggplot(aug, aes(x = ajustado, y = residuo)) +
+  geom_point(alpha = 0.3, color = "#2C5F8A") +
+  geom_hline(yintercept = 0, color = "#C0392B") +
+  labs(x = "Unidades ajustadas", y = "Residuo", title = "Residuos frente a valores ajustados (muestra de 5,000 líneas)") +
+  theme_minimal()
+
+ggplot(aug, aes(sample = residuo)) +
+  stat_qq(alpha = 0.3, color = "#2C5F8A") +
+  stat_qq_line(color = "#C0392B") +
+  labs(x = "Cuantiles teóricos", y = "Cuantiles de los residuos", title = "Gráfico Q-Q de los residuos") +
+  theme_minimal()
+```
+
+**Interpretación.**
+
+- **Linealidad.** La prueba RESET da p `r fp(reset$p.value)`: `r ifelse(reset$p.value < 0.05, "hay indicios de que la forma lineal no es la adecuada.", "no hay indicios de que falte una forma no lineal.")`
+- **Varianza constante.** Breusch-Pagan da p `r fp(bp$p.value)`: `r ifelse(bp$p.value < 0.05, "hay heterocedasticidad.", "no hay evidencia de heterocedasticidad.")` De todos modos, los errores estándar del modelo son robustos.
+- **Multicolinealidad.** El descuento y la campaña están correlacionados (r = `r r2(r_DC)`) porque D vale 0 exactamente cuando C vale 0. Sus VIF son `r r2(vif["D"])` y `r r2(vif["C"])`, por debajo de 10, de modo que ambos coeficientes se pueden estimar, aunque con menos precisión que si fueran independientes. El precio no está relacionado con las demás (VIF = `r r2(vif["P"])`).
+- **Normalidad.** Las unidades solo toman valores enteros de 1 a 10, por lo que los residuos no son normales (el gráfico Q-Q forma escalones). Con 274,566 observaciones esto no afecta la inferencia sobre los coeficientes, por el teorema del límite central.
+- **Independencia.** Las líneas de una misma orden no son independientes entre sí, por lo que los errores estándar se agrupan por orden. La independencia entre períodos se revisa en el modelo semanal.
+
+# Modelo complementario: regresión log-log
+
+```{r loglog}
+m3 <- lm(log(Q) ~ log(D), data = con_desc)
+V3 <- vcovCL(m3, cluster = con_desc$order_id, type = "HC1")
+
+m4 <- lm(log(Q) ~ log(D) + log(P) + category_name, data = con_desc)
+V4 <- vcovCL(m4, cluster = con_desc$order_id, type = "HC1")
+
+nombres_ll <- c("(Intercept)" = "Constante", "log(D)" = "ln(descuento): elasticidad", "log(P)" = "ln(precio)")
+nombres <- c(nombres, nombres_ll)
+
+e3 <- tabla_coef(m3, V3)
+e4 <- tabla_coef(m4, V4, terminos = c("(Intercept)", "log(D)", "log(P)"))
+e3$Modelo <- "Sin controles"
+e4$Modelo <- "Con precio y categoría"
+tab_ll <- bind_rows(e3, e4) %>%
+  filter(Término != "Constante") %>%
+  mutate(`Valor p` = ifelse(`Valor p` < 0.001, "< 0.001", sprintf("%.3f", `Valor p`))) %>%
+  select(Modelo, everything())
+kable(tab_ll, digits = 4)
+
+el <- e3[e3$Término == "ln(descuento): elasticidad", ]
+```
+
+```{r grafico_loglog}
+medias_nivel <- con_desc %>%
+  group_by(D = round(D)) %>%
+  summarise(lnQ = mean(log(Q)), lnD = log(first(round(D))), .groups = "drop")
+
+ggplot(medias_nivel, aes(x = log(D), y = lnQ)) +
+  geom_point(color = "#2C5F8A", size = 2) +
+  geom_smooth(method = "lm", se = TRUE, color = "#C0392B") +
+  coord_cartesian(ylim = c(1.5, 1.9)) +
+  labs(x = "ln(descuento)", y = "ln(unidades) medio",
+       title = "Modelo log-log: unidades frente al descuento (solo líneas con campaña)") +
+  theme_minimal()
+```
+
+**Interpretación.** La elasticidad estimada es `r r2(el$Coeficiente, 4)` (IC 95 %: `r r2(el$"IC 95% inf", 4)` a `r r2(el$"IC 95% sup", 4)`; p `r fp(el$"Valor p")`). Es decir, un aumento de 10 % en el descuento (por ejemplo, de 15 a 16.5 puntos) se asocia con un cambio de `r r2(100 * (1.10^el$Coeficiente - 1), 3)` % en las unidades vendidas, y el intervalo incluye el cero. La demanda **no responde** al nivel de descuento, y los controles no cambian el resultado. Esto coincide con el modelo lineal.
+
+# Modelo semanal (serie de tiempo)
+
+Para verificar la conclusión con otra unidad de observación se agregan las ventas por **semana** (solo semanas completas). Aquí $Q_t$ son las unidades vendidas en la semana $t$, $D_t$ el descuento promedio de la semana, $P_t$ el precio promedio y $C_t$ indica si la semana tuvo campaña.
+
+```{r semanal}
+semanal <- lineas %>%
+  inner_join(orders, by = "order_id") %>%
+  mutate(sem = isoweek(order_date), yr = isoyear(order_date)) %>%
+  group_by(yr, sem) %>%
+  summarise(dias = n_distinct(order_date), Q = sum(Q), D = mean(D), P = mean(P),
+            C = as.integer(mean(C) > 0.5), .groups = "drop") %>%
+  arrange(yr, sem) %>%
+  filter(dias == 7) %>%
+  mutate(t = row_number())
+
+r_DC_sem <- cor(semanal$D, semanal$C)
+```
+
+En el nivel semanal, D y C son **casi la misma variable** (r = `r r2(r_DC_sem, 3)`): toda la semana tiene campaña o ninguna, y en las semanas con campaña el descuento promedio es casi constante. Por eso no se incluyen juntas; se estiman dos modelos, uno con D y otro con C, ambos con el precio y una tendencia en el tiempo ($t$ = número de semana).
+
+```{r semanal_modelos}
+ms_C <- lm(Q ~ C + P + t, data = semanal)
+ms_D <- lm(Q ~ D + P + t, data = semanal)
+
+tab_sem <- bind_rows(
+  tidy(ms_C, conf.int = TRUE) %>% filter(term == "C") %>% mutate(Modelo = "Con indicador de campaña (C)"),
+  tidy(ms_D, conf.int = TRUE) %>% filter(term == "D") %>% mutate(Modelo = "Con descuento promedio (D)")) %>%
+  transmute(Modelo, Coeficiente = estimate, `IC 95% inf` = conf.low, `IC 95% sup` = conf.high,
+            `Valor p` = ifelse(p.value < 0.001, "< 0.001", sprintf("%.3f", p.value)))
+kable(tab_sem, digits = 1)
+
+dw <- dwtest(ms_C)
+prom_sem <- mean(semanal$Q)
+```
+
+**Interpretación.** Una semana con campaña se asocia con `r r2(coef(ms_C)["C"], 0)` unidades de diferencia frente a una semana sin campaña, sobre un promedio de `r round(prom_sem)` unidades por semana (p `r fp(summary(ms_C)$coefficients["C", 4])`), una diferencia `r ifelse(summary(ms_C)$coefficients["C", 4] < 0.05, "significativa", "no significativa")` y de signo `r ifelse(coef(ms_C)["C"] < 0, "negativo", "positivo")`; el modelo con el descuento promedio lleva a la misma conclusión (p `r fp(summary(ms_D)$coefficients["D", 4])`). En ningún caso la campaña se asocia con **más** unidades. La prueba de Durbin-Watson, que revisa si las semanas consecutivas están correlacionadas, da p `r fp(dw$p.value)`: `r ifelse(dw$p.value < 0.05, "hay autocorrelación, por lo que los errores estándar deben tomarse con cautela.", "no hay evidencia de autocorrelación, así que el supuesto de independencia entre períodos se cumple.")` Con solo `r nrow(semanal)` semanas y una estacionalidad no controlada por completo, este modelo se usa como **comprobación**; el análisis principal es el de línea de orden.
+
+# Escenarios de descuento
+
+El modelo se usa ahora para comparar escenarios **dentro del rango observado (5 % a 25 %)**, más el caso sin descuento como referencia. Se calculan con el modelo principal (sección 4.1).
+
+## Unidades esperadas frente a las unidades necesarias para compensar el descuento
+
+Con un descuento de D puntos, el precio efectivo baja a (1 − D/100) del original, así que las unidades deben subir a 1 / (1 − D/100) veces las unidades sin descuento solo para **mantener el mismo ingreso**. Se compara lo que el modelo espera con ese requisito.
+
+```{r equilibrio}
+P_medio <- mean(lineas$P)
+niveles <- c(0, 5, 10, 15, 20, 25)
+
+# Unidades esperadas (con IC 95 %) para un precio medio y un descuento dado
+pred_q <- function(d) {
+  x  <- c(1, d, P_medio, as.integer(d > 0))
+  est <- sum(x * coef(m1))
+  ee  <- sqrt(as.numeric(t(x) %*% V1 %*% x))
+  q   <- qt(0.975, df.residual(m1))
+  c(est = est, inf = est - q * ee, sup = est + q * ee)
+}
+
+esc <- bind_rows(lapply(niveles, function(d) { p <- pred_q(d); tibble(D = d, est = p["est"], inf = p["inf"], sup = p["sup"]) }))
+q0 <- esc$est[esc$D == 0]
+
+esc <- esc %>%
+  mutate(requerido = q0 / (1 - D / 100),
+         `Aumento esperado %` = 100 * (est / q0 - 1),
+         `Aumento requerido %` = 100 * (requerido / q0 - 1),
+         `¿Compensa el descuento?` = ifelse(D == 0, "—", ifelse(sup >= requerido, "Posible", "No")))
+
+kable(transmute(esc, `Descuento (%)` = D, `Unidades esperadas` = est, `IC 95% inf` = inf, `IC 95% sup` = sup,
+                `Unidades necesarias` = requerido, `Aumento esperado %`, `Aumento requerido %`, `¿Compensa el descuento?`),
+      digits = 2)
+```
+
+```{r grafico_equilibrio}
+ggplot(esc, aes(x = D)) +
+  geom_ribbon(aes(ymin = inf, ymax = sup), fill = "#9DB9D3", alpha = 0.6) +
+  geom_line(aes(y = est, color = "Unidades esperadas (modelo)"), linewidth = 1) +
+  geom_line(aes(y = requerido, color = "Unidades necesarias para compensar"), linewidth = 1, linetype = "dashed") +
+  scale_color_manual(values = c("Unidades esperadas (modelo)" = "#2C5F8A",
+                                "Unidades necesarias para compensar" = "#C0392B")) +
+  labs(x = "Descuento (puntos porcentuales)", y = "Unidades por línea", color = NULL,
+       title = "Unidades esperadas y unidades necesarias para compensar el descuento") +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+**Interpretación.** El modelo espera casi las mismas unidades en todos los niveles de descuento (alrededor de `r r2(q0, 2)`), mientras que para compensar un descuento de 25 puntos harían falta `r r2(esc$requerido[esc$D == 25], 2)` unidades, un aumento de `r r2(esc$"Aumento requerido %"[esc$D == 25], 1)` %. Con ningún descuento del rango el límite superior del intervalo alcanza el aumento requerido: `r ifelse(all(esc$"¿Compensa el descuento?"[esc$D > 0] == "No"), "ningún nivel de descuento se compensa con el aumento de unidades.", "algún nivel podría compensarse dentro del intervalo de confianza.")`
+
+## Ingreso neto esperado de las líneas con campaña
+
+Se calcula cuánto ingreso neto (precio × unidades × (1 − descuento)) generarían las **líneas que hoy tienen campaña** bajo distintos escenarios, usando los precios reales de cada línea y las unidades que predice el modelo. El intervalo se obtiene combinando la incertidumbre de los coeficientes (método delta).
+
+```{r escenarios}
+camp <- filter(lineas, C == 1)
+
+# Vector g tal que: ingreso neto esperado = sum(g * coeficientes)
+vector_g <- function(D_nuevo, C_nuevo) {
+  nd <- data.frame(D = D_nuevo, P = camp$P, C = C_nuevo)
+  Xs <- model.matrix(~ D + P + C, nd)
+  colSums(camp$P * (1 - D_nuevo / 100) * Xs)
+}
+
+g_actual <- vector_g(camp$D, 1)
+
+definir <- list(
+  "Actual (descuentos observados)" = g_actual,
+  "Sin descuentos"                 = vector_g(rep(0, nrow(camp)), 0),
+  "Descuento de 5 %"               = vector_g(rep(5, nrow(camp)), 1),
+  "Descuento de 10 %"              = vector_g(rep(10, nrow(camp)), 1),
+  "Descuento de 15 %"              = vector_g(rep(15, nrow(camp)), 1),
+  "Descuento de 20 %"              = vector_g(rep(20, nrow(camp)), 1),
+  "Descuento de 25 %"              = vector_g(rep(25, nrow(camp)), 1))
+
+tab_esc <- bind_rows(lapply(names(definir), function(nombre) {
+  g  <- definir[[nombre]]
+  dg <- g - g_actual
+  dif <- sum(dg * coef(m1))
+  ee  <- sqrt(as.numeric(t(dg) %*% V1 %*% dg))
+  q   <- qt(0.975, df.residual(m1))
+  tibble(Escenario = nombre, ingreso = sum(g * coef(m1)), dif = dif, inf = dif - q * ee, sup = dif + q * ee)
+}))
+
+ingreso_actual <- tab_esc$ingreso[1]
+kable(transmute(tab_esc,
+                Escenario,
+                `Ingreso neto esperado (millones)` = ingreso / 1e6,
+                `Diferencia vs. actual (millones)` = dif / 1e6,
+                `IC 95% inf` = inf / 1e6, `IC 95% sup` = sup / 1e6,
+                `Diferencia %` = 100 * dif / ingreso_actual), digits = 2)
+
+sin_desc <- tab_esc[tab_esc$Escenario == "Sin descuentos", ]
+d25 <- tab_esc[tab_esc$Escenario == "Descuento de 25 %", ]
+d5  <- tab_esc[tab_esc$Escenario == "Descuento de 5 %", ]
+```
+
+```{r grafico_escenarios}
+tab_esc %>%
+  mutate(Escenario = factor(Escenario, levels = rev(Escenario))) %>%
+  ggplot(aes(x = Escenario, y = ingreso / 1e6)) +
+  geom_col(fill = "#2C5F8A") +
+  geom_text(aes(label = round(ingreso / 1e6, 1)), hjust = -0.1, size = 3.5) +
+  coord_flip(ylim = c(0, max(tab_esc$ingreso) / 1e6 * 1.12)) +
+  labs(x = NULL, y = "Ingreso neto esperado (millones)",
+       title = "Ingreso neto esperado de las líneas que hoy tienen campaña") +
+  theme_minimal()
+```
+
+**Interpretación.** Como las unidades no cambian con el descuento, el ingreso neto depende casi solo del precio efectivo. Si las líneas con campaña se vendieran **sin descuento**, el ingreso neto esperado aumentaría en `r r2(sin_desc$dif / 1e6, 1)` millones (IC 95 %: `r r2(sin_desc$inf / 1e6, 1)` a `r r2(sin_desc$sup / 1e6, 1)`), un `r r2(100 * sin_desc$dif / ingreso_actual, 1)` % más. Un descuento uniforme de 5 % dejaría un ingreso neto `r r2(d5$dif / 1e6, 1)` millones mayor que el actual, y uno de 25 % lo dejaría `r r2(abs(d25$dif) / 1e6, 1)` millones menor. **Bajo este modelo, cuanto menor es el descuento, mayor es el ingreso neto**, porque nada de lo que se cede se recupera en unidades. Esta es la base de la Fase 5, donde se formulará la asignación óptima de la inversión en descuentos.
+
+# Margen de contribución
+
+El ejemplo de la ingeniera indica calcular el margen de contribución **solo si existen precios efectivos y costos fiables**. Los precios efectivos sí existen (`subtotal` y `monto_venta`), pero la base **no contiene costos**, de modo que el margen de contribución no puede calcularse y no se presenta como resultado del proyecto.
+
+Lo que sí se puede mostrar es **por qué los costos harían más exigente el equilibrio**. Si el margen de contribución es una fracción *m* del precio, las unidades deben aumentar en d / (m − d) para compensar un descuento *d*. La tabla es **ilustrativa** (no son datos de la empresa): con margen de 100 % corresponde al caso sin costos de este proyecto.
+
+```{r margen}
+d <- 0.15
+margenes <- c(1, 0.5, 0.3)
+kable(tibble(`Margen de contribución (m)` = percent(margenes),
+             `Aumento de unidades necesario con descuento de 15 %` = percent(d / (margenes - d), accuracy = 0.1)))
+```
+
+Como el aumento observado es nulo, con costos reales el descuento resultaría todavía menos conveniente. Cuando se disponga de costos (por ejemplo, en la Fase 4 de Dirección Financiera), este cálculo podrá hacerse con datos reales.
+
+# Limitaciones
+
+- **Asociación, no causalidad.** Las campañas se asignan por semana del año y no de forma aleatoria; los coeficientes describen asociaciones.
+- **Rango observado.** Solo hay descuentos de 0 % y de 5 % a 25 %; el modelo no permite predecir descuentos mayores ni decir qué ocurriría con descuentos menores de 5 % distintos de cero.
+- **Un solo comercio y datos con patrones muy regulares** (cantidades y precios repartidos de forma pareja), lo que limita la generalización.
+- **Sin costos.** No se puede medir rentabilidad ni margen de contribución.
+- **Estacionalidad en el modelo semanal.** Se controla solo con una tendencia lineal; la comparación con semanas vecinas de la Fase 3 estadística la trata con más detalle.
+
+# Conclusiones
+
+```{r conclusiones, echo=FALSE}
+kable(tibble(
+  Medida = c("Asociación descuento–unidades (por punto %)",
+             "Elasticidad de las unidades respecto del descuento",
+             "Efecto de la campaña en unidades por línea",
+             "Aumento de unidades requerido con descuento de 25 %",
+             "Cambio en el ingreso neto al eliminar los descuentos (millones)"),
+  Valor = c(paste0(r2(b_D$Coeficiente, 4), " (p ", fp(b_D$"Valor p"), ")"),
+            paste0(r2(el$Coeficiente, 4), " (p ", fp(el$"Valor p"), ")"),
+            paste0(r2(b_C$Coeficiente, 3), " (p ", fp(b_C$"Valor p"), ")"),
+            paste0(r2(esc$"Aumento requerido %"[esc$D == 25], 1), " %"),
+            paste0("+", r2(sin_desc$dif / 1e6, 1))))
+)
+```
+
+1. **Las unidades vendidas no dependen del descuento.** Ni el modelo lineal (β1 ≈ 0) ni el log-log (elasticidad ≈ 0) muestran una relación, con intervalos de confianza estrechos alrededor de cero y resultados iguales al incluir categoría, año y mes; el modelo semanal tampoco muestra un aumento de unidades con campaña (su coeficiente es negativo y no significativo).
+2. **Ningún nivel de descuento se compensa.** Para mantener el ingreso, las unidades tendrían que aumentar entre `r r2(esc$"Aumento requerido %"[esc$D == 5], 1)` % (descuento de 5 %) y `r r2(esc$"Aumento requerido %"[esc$D == 25], 1)` % (descuento de 25 %), y el modelo no espera ningún aumento.
+3. **El descuento se traduce directamente en ingreso cedido.** Bajo el modelo, vender sin descuento las líneas hoy en campaña habría dado `r r2(sin_desc$dif / 1e6, 1)` millones más de ingreso neto.
+4. **Para las fases siguientes:** el modelo entrega la relación unidades–descuento (plana) que se usará en la Fase 4 (impacto financiero, con costos si se consiguen) y en la Fase 5 (optimización de la asignación de descuentos).
+
+# Referencias
+
+- Wickham, H. y Grolemund, G. (2017). *R for Data Science*. O'Reilly. Capítulo 23, Model basics: https://r4ds.had.co.nz/model-basics.html
+- Zeileis, A. (2004). Econometric computing with HC and HAC covariance matrix estimators. *Journal of Statistical Software, 11*(10), 1–17 (paquete `sandwich`).
+- Zeileis, A. y Hothorn, T. (2002). Diagnostic checking in regression relationships. *R News, 2*(3), 7–10 (paquete `lmtest`).

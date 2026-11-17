@@ -1,0 +1,926 @@
+---
+title: "Proyecto Integrador – Fase 3: Análisis estadístico"
+subtitle: "Evaluación de la inversión en descuentos promocionales de una empresa e-commerce (2016–2022)"
+author: "Grupo 3: Rocha Karin, Raña Sebastián, Lecoña Camila"
+date: "`r format(Sys.Date(), '%d/%m/%Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.align = "center", fig.width = 8, fig.height = 4.5)
+options(scipen = 999, digits = 6)
+
+meses_es <- c("enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto",
+              "septiembre", "octubre", "noviembre", "diciembre")
+
+# Redondeo a 2 decimales sin mostrar "-0.00"
+r2 <- function(x) format(round(x, 2) + 0, nsmall = 2)
+
+# Formato de valores p para el texto: "< 0.001" o "= 0.123"
+fp <- function(p) ifelse(p < 0.001, "< 0.001", paste0("= ", sprintf("%.3f", p)))
+```
+
+# Planteamiento del proyecto
+
+## Título
+
+Solución de Business Intelligence a través de Data Science para evaluar y optimizar la inversión en descuentos promocionales de una empresa e-commerce: OLTP (2016–2022).
+
+## Problema y pregunta
+
+Entre 2016 y 2022 las ventas anuales de la empresa se mantuvieron prácticamente constantes, mientras que la empresa otorgó descuentos de entre 5 % y 25 % en 16 campañas promocionales. No existe evidencia de que esos descuentos aumenten las ventas.
+
+**Pregunta:** ¿generan las campañas promocionales un aumento de ventas suficiente para compensar los ingresos que la empresa renuncia al otorgar descuentos y, en caso contrario, cómo debería asignarse la inversión en descuentos para maximizar el **ingreso neto**?
+
+## Objetivo
+
+Determinar, mediante una solución de Business Intelligence basada en el Data Warehouse de ventas, si las campañas promocionales generan un aumento de ventas que compense los ingresos cedidos en descuentos, y definir la asignación de campañas, categorías y niveles de descuento que maximice el ingreso neto de la empresa.
+
+> **Nota sobre "rentabilidad":** la base de datos no contiene costos, por lo que no es posible medir rentabilidad (ingreso menos costo). Todo el análisis se hace sobre el **ingreso neto**.
+
+## Definiciones operativas
+
+| Concepto | Definición |
+|---|---|
+| Ingreso bruto | `subtotal` = cantidad × precio, sin descuento |
+| Ingreso neto (variable dependiente) | `monto_venta = subtotal × (1 − discount)` |
+| Descuento cedido | ingreso bruto − ingreso neto |
+| Orden con campaña | orden con campaña asignada, es decir, `campaña_key` distinto de −1 (todas sus líneas tienen descuento) |
+| Orden sin campaña | orden con `campaña_key` = −1, "Sin campaña" (descuento = 0) |
+| Unidad de análisis | la **orden** (`order_id`); en algunos análisis, la línea de orden |
+
+## Volumen y estacionalidad
+
+Las campañas cubren cerca del 29 % de las semanas y el 28 % de las órdenes, de modo que **siempre habrá menos ventas con campaña que sin campaña**. Por eso no se comparan totales, sino **promedios por orden y por semana**, que no dependen del tamaño de cada grupo (la prueba t de Welch admite grupos de distinto tamaño). Además, como las campañas ocurren en semanas fijas del año, se controla la estacionalidad comparando cada semana con campaña con las semanas cercanas sin campaña.
+
+## Por qué se analizan varias medidas
+
+El ingreso neto de una orden con campaña es **menor por construcción**, porque ya tiene el descuento restado. Por eso, comparar solo el ingreso neto no demuestra si la campaña vende más. Para saber si la promoción genera demanda adicional se compara también lo que **no depende del descuento**: el ingreso bruto, las unidades, las líneas y el número de órdenes por semana. El ingreso neto se usa después para medir cuánto cuesta la promoción.
+
+# Datos
+
+El análisis parte del Data Warehouse construido en la Fase 2 (`MarketingDW`, modelo estrella). R se conecta directamente a SQL Server y lee la tabla de hechos `FACT_VENTAS` con sus dimensiones.
+
+Solo dos secciones (órdenes por semana y supervivencia) necesitan la **fecha exacta** de cada orden. El DW guarda la fecha a nivel de mes (`DIM_TIEMPO`), por lo que para esas secciones se lee además la tabla `orders` de la base transaccional `MarketingOLTP`.
+
+```{r paquetes}
+paquetes <- c("dplyr", "tidyr", "ggplot2", "lubridate", "scales", "broom", "survival", "knitr", "DBI", "odbc")
+faltan <- paquetes[!paquetes %in% rownames(installed.packages())]
+if (length(faltan) > 0) install.packages(faltan, repos = "https://cloud.r-project.org")
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(lubridate)
+library(scales)
+library(broom)
+library(survival)
+library(knitr)
+library(DBI)
+```
+
+## Conexión a SQL Server
+
+```{r conexion}
+servidor <- "T003-Fila2-12"   # nombre de tu servidor SQL Server (el mismo que aparece en SSMS)
+
+drivers <- unique(odbc::odbcListDrivers()$name)
+driver  <- intersect(c("SQL Server Native Client 11.0", "ODBC Driver 17 for SQL Server",
+                       "ODBC Driver 13 for SQL Server", "SQL Server"), drivers)[1]
+if (is.na(driver)) stop("No se encontró un driver ODBC de SQL Server en este equipo.")
+
+conectar <- function(base) {
+  dbConnect(odbc::odbc(), Driver = driver, Server = servidor,
+            Database = base, Trusted_Connection = "Yes")
+}
+
+con_dw   <- conectar("MarketingDW")
+con_oltp <- conectar("MarketingOLTP")
+```
+
+## Lectura del Data Warehouse
+
+```{r lectura}
+fact      <- dbGetQuery(con_dw, "SELECT * FROM FACT_VENTAS")
+productos <- dbGetQuery(con_dw, "SELECT producto_key, product_name, subcategory_id, subcategory_name, category_id, category_name FROM DIM_PRODUCTO")
+tiempo    <- dbGetQuery(con_dw, "SELECT * FROM DIM_TIEMPO")
+
+clientes     <- dbGetQuery(con_dw, "SELECT cliente_key, country FROM DIM_CLIENTE")
+proveedores  <- dbGetQuery(con_dw, "SELECT proveedor_key, supplier_name FROM DIM_PROVEEDOR")
+pagos        <- dbGetQuery(con_dw, "SELECT metodo_pago_key, payment_method FROM DIM_METODO_PAGO")
+
+# El nombre de DIM_CAMPAÑA se busca dentro de SQL Server para evitar problemas con la ñ
+campanas <- dbGetQuery(con_dw, "SET NOCOUNT ON;
+  DECLARE @t NVARCHAR(200) = (SELECT TOP 1 name FROM sys.tables WHERE name LIKE 'DIM[_]CAMP%');
+  DECLARE @q NVARCHAR(400) = N'SELECT * FROM ' + QUOTENAME(@t);
+  EXEC(@q);")
+
+# Las columnas con ñ se renombran para evitar problemas de codificación
+names(fact)[grepl("^campa.{1,3}a_key$", names(fact))]         <- "campana_key"
+names(campanas)[grepl("^campa.{1,3}a_key$", names(campanas))] <- "campana_key"
+names(tiempo)[grepl("^a.{1,3}o$", names(tiempo))]             <- "anio"
+```
+
+Fechas exactas de las órdenes, desde la base transaccional (se usan solo en las secciones de semanas y supervivencia):
+
+```{r lectura_oltp}
+orders <- dbGetQuery(con_oltp, "SELECT order_id, customer_id, order_date, campaign_id FROM orders")
+orders$order_date <- as.Date(orders$order_date)
+```
+
+## Construcción de las tablas de análisis
+
+Se construye una tabla de **líneas de orden** (`FACT_VENTAS` con sus dimensiones) y, a partir de ella, una tabla de **órdenes**.
+
+```{r tablas}
+lineas <- fact %>%
+  inner_join(select(productos, producto_key, category_name, subcategory_name), by = "producto_key") %>%
+  inner_join(select(tiempo, tiempo_key, anio, mes, semestre), by = "tiempo_key") %>%
+  mutate(campana = factor(ifelse(campana_key == -1, "Sin campaña", "Con campaña"),
+                          levels = c("Sin campaña", "Con campaña")),
+         precio_unit = subtotal / quantity)
+
+ordenes <- lineas %>%
+  group_by(order_id, campana_key, campana, metodo_pago_key, anio, mes, semestre) %>%
+  summarise(bruto = sum(subtotal), neto = sum(monto_venta),
+            unidades = sum(quantity), lineas = n(), .groups = "drop") %>%
+  mutate(desc_prom = 1 - neto / bruto)
+```
+
+## Verificación de los datos
+
+Se comprueba que las cifras coinciden con las del planteamiento del problema.
+
+```{r verificacion}
+verif <- tibble(
+  Indicador = c("Órdenes", "Líneas de venta", "Ingreso bruto", "Ingreso neto",
+                "Descuento cedido", "Descuento / ingreso bruto",
+                "Órdenes con campaña"),
+  Valor = c(format(nrow(ordenes), big.mark = ","),
+            format(nrow(lineas), big.mark = ","),
+            format(round(sum(lineas$subtotal), 2), big.mark = ","),
+            format(round(sum(lineas$monto_venta), 2), big.mark = ","),
+            format(round(sum(lineas$subtotal) - sum(lineas$monto_venta), 2), big.mark = ","),
+            percent(1 - sum(lineas$monto_venta) / sum(lineas$subtotal), accuracy = 0.1),
+            percent(mean(ordenes$campana == "Con campaña"), accuracy = 0.1))
+)
+kable(verif)
+```
+
+Valores faltantes en las variables principales:
+
+```{r nulos}
+colSums(is.na(select(lineas, subtotal, discount, quantity, monto_venta, anio, category_name)))
+```
+
+# Análisis exploratorio
+
+## Ventas anuales
+
+```{r anual}
+anual <- lineas %>%
+  group_by(anio) %>%
+  summarise(bruto = sum(subtotal), neto = sum(monto_venta),
+            descuento = bruto - neto, ordenes = n_distinct(order_id))
+kable(mutate(anual, anio = as.character(anio)), format.args = list(big.mark = ","), digits = 0)
+
+ggplot(anual, aes(x = factor(anio), y = neto / 1e6)) +
+  geom_col(fill = "#2C5F8A") +
+  geom_text(aes(label = round(neto / 1e6, 1)), vjust = -0.4) +
+  labs(x = "Año", y = "Ingreso neto (millones)", title = "Ingreso neto anual") +
+  theme_minimal()
+```
+
+Las ventas anuales se mantienen casi constantes: no hay tendencia de crecimiento.
+
+## Campañas
+
+```{r campanas}
+por_campana <- lineas %>%
+  filter(campana_key != -1) %>%
+  left_join(campanas, by = "campana_key") %>%
+  group_by(campana_key, campaign_name, offer_week) %>%
+  summarise(ordenes = n_distinct(order_id), bruto = sum(subtotal),
+            neto = sum(monto_venta), descuento_cedido = bruto - neto,
+            desc_prom = percent(1 - neto / bruto, accuracy = 0.1), .groups = "drop")
+kable(por_campana, format.args = list(big.mark = ","), digits = 0)
+```
+
+La campaña 10 (BlackFridaySale) no aparece porque comparte la semana 48 con ThanksgivingSale y todas las órdenes de esa semana quedan asignadas a esta última.
+
+## Variación de las variables
+
+Siguiendo la guía de análisis exploratorio de *R for Data Science* (Wickham y Grolemund), se comienza describiendo cómo varía cada variable por separado.
+
+```{r var_cantidad}
+ggplot(lineas, aes(x = quantity)) +
+  geom_bar(fill = "#2C5F8A") +
+  scale_x_continuous(breaks = 1:10) +
+  labs(x = "Cantidad por línea", y = "Líneas de venta", title = "Cantidad de unidades por línea de venta") +
+  theme_minimal()
+```
+
+```{r var_precio}
+ggplot(lineas, aes(x = precio_unit)) +
+  geom_histogram(bins = 40, fill = "#2C5F8A", color = "white") +
+  scale_x_continuous(labels = comma) +
+  labs(x = "Precio unitario", y = "Líneas de venta", title = "Distribución del precio unitario") +
+  theme_minimal()
+```
+
+```{r var_descuento}
+lineas %>%
+  filter(discount > 0) %>%
+  ggplot(aes(x = discount)) +
+  geom_histogram(binwidth = 0.01, boundary = 0, fill = "#2C5F8A", color = "white") +
+  scale_x_continuous(labels = percent) +
+  labs(x = "Descuento", y = "Líneas con descuento", title = "Distribución del descuento (solo líneas con campaña)") +
+  theme_minimal()
+```
+
+```{r var_orden}
+ggplot(ordenes, aes(x = bruto, fill = campana)) +
+  geom_histogram(bins = 50, alpha = 0.6, position = "identity") +
+  scale_x_continuous(labels = comma) +
+  labs(x = "Ingreso bruto por orden", y = "Órdenes", fill = NULL,
+       title = "Distribución del ingreso bruto por orden") +
+  theme_minimal()
+
+ggplot(ordenes, aes(x = campana, y = neto, fill = campana)) +
+  geom_boxplot(show.legend = FALSE) +
+  scale_y_continuous(labels = comma) +
+  labs(x = NULL, y = "Ingreso neto por orden", title = "Ingreso neto por orden: con y sin campaña") +
+  theme_minimal()
+```
+
+```{r var_texto, include=FALSE}
+q_media <- mean(lineas$quantity)
+p_med <- median(lineas$precio_unit)
+```
+
+La cantidad por línea va de 1 a 10 unidades, con una media de `r sprintf("%.1f", q_media)`, y todas las cantidades aparecen con frecuencia similar. El precio unitario se reparte de forma pareja entre aproximadamente `r round(min(lineas$precio_unit))` y `r round(max(lineas$precio_unit))`, con una mediana de `r round(p_med)`. Los descuentos van de 5 % a 25 % y se reparten de manera pareja. El valor de la orden es asimétrico a la derecha; con más de 50,000 órdenes, la prueba t funciona bien por el Teorema del Límite Central, y como respaldo se usa también la prueba no paramétrica de Mann-Whitney.
+
+## Resumen descriptivo por tipo de orden
+
+```{r descriptivo}
+desc <- ordenes %>%
+  group_by(campana) %>%
+  summarise(ordenes = n(), neto_medio = mean(neto), bruto_medio = mean(bruto),
+            unidades_medias = mean(unidades), lineas_medias = mean(lineas),
+            descuento_medio = percent(mean(desc_prom), accuracy = 0.1))
+kable(desc, format.args = list(big.mark = ","), digits = 1)
+```
+
+## Covariación: las ventas según la categoría de producto
+
+Una pregunta típica del análisis exploratorio es si las ventas son muy diferentes entre grupos (por ejemplo, entre sucursales). En este negocio los grupos naturales son las categorías de producto.
+
+```{r cov_categoria}
+por_cat <- lineas %>%
+  group_by(category_name) %>%
+  summarise(neto = sum(monto_venta), lineas = n(),
+            precio_medio = mean(precio_unit), cantidad_media = mean(quantity)) %>%
+  arrange(desc(neto))
+
+ggplot(por_cat, aes(x = reorder(category_name, neto), y = neto / 1e6)) +
+  geom_col(fill = "#2C5F8A") +
+  coord_flip() +
+  labs(x = NULL, y = "Ingreso neto (millones)", title = "Ingreso neto por categoría") +
+  theme_minimal()
+
+kable(por_cat, digits = 1, format.args = list(big.mark = ","))
+```
+
+```{r cov_categoria_precio}
+ggplot(lineas, aes(x = reorder(category_name, precio_unit, median), y = precio_unit)) +
+  geom_boxplot(fill = "#9DB9D3", outlier.size = 0.4) +
+  coord_flip() +
+  scale_y_continuous(labels = comma) +
+  labs(x = NULL, y = "Precio unitario", title = "Precio unitario por categoría") +
+  theme_minimal()
+```
+
+```{r cov_categoria_texto, include=FALSE}
+cat_top <- por_cat$category_name[1]
+cat_baja <- por_cat$category_name[nrow(por_cat)]
+razon_cat <- por_cat$neto[1] / por_cat$neto[nrow(por_cat)]
+r_lineas <- cor(por_cat$neto, por_cat$lineas)
+r_precio <- cor(por_cat$neto, por_cat$precio_medio)
+```
+
+**Hallazgo.** Las ventas sí difieren mucho entre categorías: **`r cat_top`** es la que más ingreso neto aporta y vende `r sprintf("%.1f", razon_cat)` veces más que la más baja (**`r cat_baja`**). Esa diferencia se explica por el volumen de líneas vendidas (correlación con el ingreso: `r sprintf("%.2f", r_lineas)`) y por el precio medio (`r sprintf("%.2f", r_precio)`). Esto confirma que la categoría es una variable relevante para describir las ventas; más adelante se evalúa si también cambia la respuesta al descuento.
+
+## Covariación: método de pago y proveedores
+
+```{r cov_pago}
+por_pago <- lineas %>%
+  inner_join(pagos, by = "metodo_pago_key") %>%
+  group_by(payment_method) %>%
+  summarise(ordenes = n_distinct(order_id), neto = sum(monto_venta), .groups = "drop") %>%
+  mutate(participacion = percent(neto / sum(neto), accuracy = 0.1))
+kable(por_pago, format.args = list(big.mark = ","), digits = 0)
+
+ggplot(por_pago, aes(x = reorder(payment_method, neto), y = neto / 1e6)) +
+  geom_col(fill = "#2C5F8A") +
+  coord_flip() +
+  labs(x = NULL, y = "Ingreso neto (millones)", title = "Ingreso neto por método de pago") +
+  theme_minimal()
+
+chisq_pago <- chisq.test(por_pago$ordenes)
+kw_pago <- kruskal.test(neto ~ factor(metodo_pago_key), data = ordenes)
+```
+
+```{r cov_proveedor}
+por_prov <- lineas %>%
+  inner_join(proveedores, by = "proveedor_key") %>%
+  group_by(supplier_name) %>%
+  summarise(neto = sum(monto_venta), .groups = "drop") %>%
+  arrange(desc(neto))
+
+ggplot(por_prov, aes(x = reorder(supplier_name, neto), y = neto / 1e6)) +
+  geom_col(fill = "#2C5F8A") +
+  geom_hline(yintercept = mean(por_prov$neto) / 1e6, linetype = "dashed", color = "#C0392B") +
+  coord_flip() +
+  labs(x = NULL, y = "Ingreso neto (millones)", title = "Ingreso neto por proveedor (línea roja = promedio)") +
+  theme_minimal(base_size = 8)
+
+part_top_prov <- por_prov$neto[1] / sum(por_prov$neto)
+cv_prov <- sd(por_prov$neto) / mean(por_prov$neto)
+```
+
+**Hallazgo.** El ingreso se reparte de forma pareja entre los métodos de pago (la prueba de uniformidad de órdenes da p `r fp(chisq_pago$p.value)` y la de ingreso neto por orden, p `r fp(kw_pago$p.value)`): el método de pago no influye en las ventas. Entre los `r nrow(por_prov)` proveedores tampoco hay concentración: el principal aporta `r percent(part_top_prov, accuracy = 0.1)` del ingreso, frente a un promedio de `r percent(1 / nrow(por_prov), accuracy = 0.1)`, con un coeficiente de variación de `r percent(cv_prov, accuracy = 0.1)`.
+
+## Covariación: estacionalidad
+
+```{r cov_tiempo}
+mensual <- lineas %>%
+  group_by(anio, mes) %>%
+  summarise(neto = sum(monto_venta), .groups = "drop") %>%
+  mutate(dias = days_in_month(make_date(anio, mes, 1)),
+         neto_dia = neto / dias)
+
+ggplot(mensual, aes(x = factor(mes), y = factor(anio), fill = neto_dia / 1e3)) +
+  geom_tile(color = "white") +
+  scale_fill_viridis_c(name = "Neto por día\n(miles)") +
+  labs(x = "Mes", y = "Año", title = "Ingreso neto diario promedio por mes y año") +
+  theme_minimal()
+
+mes_prom <- mensual %>% group_by(mes) %>% summarise(neto_dia = mean(neto_dia))
+
+ggplot(mes_prom, aes(x = factor(mes), y = neto_dia / 1e3)) +
+  geom_col(fill = "#2C5F8A") +
+  labs(x = "Mes", y = "Ingreso neto por día (miles)", title = "Ingreso neto diario promedio por mes") +
+  theme_minimal()
+
+aov_mes <- summary(aov(neto_dia ~ factor(mes), data = mensual))
+p_mes <- aov_mes[[1]][["Pr(>F)"]][1]
+```
+
+**Hallazgo.** Se usa el ingreso **por día** para que los meses cortos (como febrero) no parezcan más bajos solo por tener menos días. El mes con mayor ingreso diario es **`r meses_es[mes_prom$mes[which.max(mes_prom$neto_dia)]]`** y el menor es **`r meses_es[mes_prom$mes[which.min(mes_prom$neto_dia)]]`**, con una diferencia de `r percent(max(mes_prom$neto_dia) / min(mes_prom$neto_dia) - 1, accuracy = 0.1)`. El análisis de varianza entre meses da p `r fp(p_mes)`: `r ifelse(p_mes < 0.05, "existe una estacionalidad mensual", "no hay una estacionalidad mensual marcada")`.
+
+## Covariación: clientes
+
+```{r cov_clientes}
+por_cliente <- lineas %>%
+  group_by(cliente_key) %>%
+  summarise(neto = sum(monto_venta), ordenes = n_distinct(order_id))
+
+ggplot(por_cliente, aes(x = neto / 1e6)) +
+  geom_histogram(bins = 30, fill = "#2C5F8A", color = "white") +
+  labs(x = "Ingreso neto por cliente (millones)", y = "Clientes",
+       title = "Distribución del ingreso neto por cliente") +
+  theme_minimal()
+
+n_top <- ceiling(0.1 * nrow(por_cliente))
+part_top10 <- sum(sort(por_cliente$neto, decreasing = TRUE)[1:n_top]) / sum(por_cliente$neto)
+```
+
+**Hallazgo.** La base tiene `r nrow(por_cliente)` clientes, con un promedio de `r round(mean(por_cliente$ordenes))` órdenes cada uno. El 10 % de clientes con más compras aporta el `r percent(part_top10, accuracy = 0.1)` del ingreso neto, por lo que no existe una dependencia fuerte de unos pocos clientes.
+
+## Covariación entre variables numéricas
+
+```{r num_precio_cantidad}
+ggplot(lineas, aes(x = precio_unit, y = quantity)) +
+  geom_bin2d(binwidth = c(50, 1)) +
+  scale_fill_viridis_c(name = "Líneas") +
+  scale_x_continuous(labels = comma) +
+  labs(x = "Precio unitario", y = "Cantidad por línea",
+       title = "Precio unitario y cantidad comprada") +
+  theme_minimal()
+
+r_pq <- cor(lineas$precio_unit, lineas$quantity)
+```
+
+```{r num_unidades_bruto}
+ggplot(ordenes, aes(x = unidades, y = bruto)) +
+  geom_bin2d(bins = 50) +
+  geom_smooth(method = "lm", se = FALSE, color = "#C0392B") +
+  scale_fill_viridis_c(name = "Órdenes") +
+  scale_y_continuous(labels = comma) +
+  labs(x = "Unidades por orden", y = "Ingreso bruto por orden",
+       title = "Unidades e ingreso bruto por orden") +
+  theme_minimal()
+```
+
+Matriz de correlaciones entre las variables numéricas de la orden:
+
+```{r matriz_cor}
+vars_num <- ordenes %>% select(bruto, neto, unidades, lineas, desc_prom)
+mc <- cor(vars_num)
+kable(round(mc, 2))
+
+mc_largo <- as.data.frame(as.table(mc))
+names(mc_largo) <- c("x", "y", "r")
+ggplot(mc_largo, aes(x = x, y = y, fill = r)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.2f", r)), size = 3.5) +
+  scale_fill_gradient2(low = "#C0392B", mid = "white", high = "#2C5F8A", limits = c(-1, 1)) +
+  labs(x = NULL, y = NULL, fill = "r", title = "Matriz de correlación (nivel orden)") +
+  theme_minimal()
+```
+
+**Hallazgo.** El ingreso bruto de una orden depende sobre todo de las unidades que contiene (correlación de `r sprintf("%.2f", mc["bruto", "unidades"])`), y el neto sigue al bruto. En cambio, el precio unitario y la cantidad comprada no se relacionan (correlación de `r sprintf("%.3f", r_pq)`): el cliente no compra menos unidades cuando el producto es más caro. Además, el descuento promedio de la orden casi no se asocia con las unidades (`r r2(mc["desc_prom", "unidades"])`) ni con el ingreso bruto (`r r2(mc["desc_prom", "bruto"])`), lo que anticipa que el descuento no impulsa la compra.
+
+## Resumen de hallazgos exploratorios
+
+1. **Las ventas anuales no crecen:** se mantienen entre 105.7 y 109.6 millones.
+2. **La categoría sí importa:** `r cat_top` vende `r sprintf("%.1f", razon_cat)` veces más que `r cat_baja`.
+3. **No hay efecto del método de pago ni concentración de proveedores o clientes.**
+4. **El ingreso de la orden depende de las unidades,** no del descuento.
+5. **La campaña no se asocia con mayor valor de compra,** hallazgo que se contrasta con pruebas formales en las secciones siguientes.
+
+# Función de comparación entre dos grupos
+
+Se define una función que compara una variable entre órdenes con y sin campaña. Entrega las medias, la diferencia porcentual, el intervalo de confianza de la diferencia, el valor p de la prueba t (Welch) y de Mann-Whitney, y el tamaño del efecto (d de Cohen).
+
+```{r funcion}
+comparar <- function(datos, variable, etiqueta) {
+  x <- datos[[variable]][datos$campana == "Con campaña"]
+  y <- datos[[variable]][datos$campana == "Sin campaña"]
+  t <- t.test(x, y)
+  w <- wilcox.test(x, y)
+  s <- sqrt(((length(x) - 1) * var(x) + (length(y) - 1) * var(y)) / (length(x) + length(y) - 2))
+  tibble(Variable = etiqueta,
+         `Media con campaña` = mean(x),
+         `Media sin campaña` = mean(y),
+         `Diferencia %` = 100 * (mean(x) / mean(y) - 1),
+         `IC 95% dif. (inf)` = t$conf.int[1],
+         `IC 95% dif. (sup)` = t$conf.int[2],
+         `p (t Welch)` = t$p.value,
+         `p (Mann-Whitney)` = w$p.value,
+         `d de Cohen` = (mean(x) - mean(y)) / s)
+}
+
+formato_p <- function(tabla) {
+  tabla %>% mutate(across(starts_with("p ("), ~ ifelse(.x < 0.001, "<0.001", sprintf("%.3f", .x))))
+}
+```
+
+# Escenario 1: ¿las campañas aumentan el ingreso?
+
+**Hipótesis original (ingreso neto por orden):**
+
+- H₀: no hay diferencias en el ingreso neto promedio entre órdenes con y sin campaña.
+- H₁: sí hay diferencias.
+
+**Hipótesis complementaria (ingreso bruto por orden):** muestra si el cliente compra más cuando hay campaña, sin que influya el descuento.
+
+- H₀: no hay diferencias en el ingreso bruto promedio entre órdenes con y sin campaña.
+- H₁: sí hay diferencias.
+
+```{r e1}
+e1 <- bind_rows(comparar(ordenes, "neto", "Ingreso neto por orden"),
+                comparar(ordenes, "bruto", "Ingreso bruto por orden"))
+kable(formato_p(e1), digits = 2, format.args = list(big.mark = ","))
+```
+
+**Prueba t del ingreso neto, con salida completa:**
+
+```{r e1t}
+t.test(neto ~ campana, data = ordenes)
+```
+
+**Interpretación.** El ingreso neto de las órdenes con campaña es significativamente **menor** (`r sprintf("%.1f", e1$"Diferencia %"[1])` %, p `r fp(e1$"p (t Welch)"[1])`), y se rechaza H₀. Pero esto es esperable: la orden ya trae el descuento restado, así que no demuestra que la campaña vendió menos. La prueba clave es la del **ingreso bruto**: si las campañas generaran compras más grandes, el ingreso bruto con campaña sería mayor. La diferencia es de `r sprintf("%.1f", e1$"Diferencia %"[2])` % y **no es significativa** (p `r fp(e1$"p (t Welch)"[2])`; d de Cohen = `r sprintf("%.2f", e1$"d de Cohen"[2])`), por lo que no se rechaza H₀: la campaña **no aumenta el valor de compra**. El descuento se traduce directamente en ingreso cedido.
+
+## ¿Cuánto tendría que aumentar la venta para compensar el descuento?
+
+Si el descuento promedio es *d*, el ingreso bruto debe aumentar en *d / (1 − d)* para que el ingreso neto sea igual al de una orden sin campaña.
+
+```{r equilibrio}
+d <- 1 - sum(ordenes$neto[ordenes$campana == "Con campaña"]) / sum(ordenes$bruto[ordenes$campana == "Con campaña"])
+aumento_requerido <- d / (1 - d)
+aumento_observado <- mean(ordenes$bruto[ordenes$campana == "Con campaña"]) / mean(ordenes$bruto[ordenes$campana == "Sin campaña"]) - 1
+
+kable(tibble(
+  Medida = c("Descuento promedio en órdenes con campaña",
+             "Aumento del ingreso bruto necesario para compensar",
+             "Aumento del ingreso bruto observado por orden"),
+  Valor = percent(c(d, aumento_requerido, aumento_observado), accuracy = 0.1)))
+```
+
+# Escenario 2: ¿las campañas aumentan la cantidad de productos vendidos?
+
+- H₀: no hay diferencias en la cantidad promedio de productos vendidos entre órdenes con y sin descuento.
+- H₁: sí hay diferencias.
+
+Se compara la cantidad de unidades y el número de líneas por orden.
+
+```{r e2}
+e2 <- bind_rows(comparar(ordenes, "unidades", "Unidades por orden"),
+                comparar(ordenes, "lineas", "Líneas (productos distintos) por orden"))
+kable(formato_p(e2), digits = 2)
+```
+
+## Efecto sobre el número de órdenes
+
+Las campañas se asignan por semana: todas las órdenes de una semana de oferta tienen campaña. Por eso se puede comparar el **número de órdenes por semana** entre semanas con y sin campaña. Esto mide si la promoción atrae más clientes. Se excluyen las dos semanas incompletas de los extremos del período, que quedan con menos de 7 días de datos.
+
+```{r semanas}
+semanas <- ordenes %>%
+  inner_join(select(orders, order_id, order_date), by = "order_id") %>%
+  mutate(sem = isoweek(order_date), yr = isoyear(order_date)) %>%
+  group_by(yr, sem) %>%
+  summarise(dias = n_distinct(order_date), ordenes = n(), bruto = sum(bruto), neto = sum(neto),
+            prop_camp = mean(campana == "Con campaña"), .groups = "drop") %>%
+  arrange(yr, sem) %>%
+  filter(dias == 7) %>%   # se excluyen las semanas incompletas (primera y última del período)
+  mutate(campana = factor(ifelse(prop_camp > 0.5, "Con campaña", "Sin campaña"),
+                          levels = c("Sin campaña", "Con campaña")))
+
+table(semanas$prop_camp)  # 0 o 1: toda la semana tiene campaña o ninguna
+
+e2s <- bind_rows(comparar(semanas, "ordenes", "Órdenes por semana"),
+                 comparar(semanas, "bruto", "Ingreso bruto por semana"),
+                 comparar(semanas, "neto", "Ingreso neto por semana"))
+kable(formato_p(e2s), digits = 2, format.args = list(big.mark = ","))
+```
+
+```{r graf_semanas}
+ggplot(semanas, aes(x = campana, y = ordenes, fill = campana)) +
+  geom_boxplot(show.legend = FALSE) +
+  labs(x = NULL, y = "Órdenes por semana",
+       title = "Órdenes por semana: con y sin campaña") +
+  theme_minimal()
+```
+
+**Interpretación.** Las órdenes con campaña tienen las mismas unidades (`r sprintf("%.1f", e2$"Diferencia %"[1])` %, p `r fp(e2$"p (t Welch)"[1])`) y las mismas líneas (p `r fp(e2$"p (t Welch)"[2])`) que las órdenes sin campaña: no se rechaza H₀. Además, las semanas con campaña no tienen más órdenes (`r sprintf("%.1f", e2s$"Diferencia %"[1])` %, p `r fp(e2s$"p (t Welch)"[1])`); su ingreso bruto semanal es ligeramente menor (`r sprintf("%.1f", e2s$"Diferencia %"[2])` %, p `r fp(e2s$"p (t Welch)"[2])`), diferencia que deja de ser significativa al controlar la estacionalidad (sección siguiente). El descuento **no incrementa la cantidad vendida ni atrae más clientes**.
+
+## Control de la estacionalidad: comparación con semanas vecinas
+
+Las campañas caen siempre en las mismas semanas del año (Navidad, Día de la Madre, etc.), así que comparar contra *todas* las semanas sin campaña podría mezclar el efecto de la promoción con la estacionalidad. Para controlarlo, cada semana con campaña se compara con el promedio de las semanas **sin campaña más cercanas** (hasta dos antes y dos después).
+
+```{r vecinas}
+sem_ord <- semanas %>% mutate(i = row_number())
+
+promedio_vecinas <- function(k, columna) {
+  vecinas <- sem_ord[sem_ord$i %in% c(k - 2, k - 1, k + 1, k + 2) & sem_ord$campana == "Sin campaña", ]
+  mean(vecinas[[columna]])
+}
+
+camp_sem <- filter(sem_ord, campana == "Con campaña")
+pareado <- tibble(
+  ordenes_camp = camp_sem$ordenes,
+  ordenes_vec  = sapply(camp_sem$i, promedio_vecinas, columna = "ordenes"),
+  bruto_camp   = camp_sem$bruto,
+  bruto_vec    = sapply(camp_sem$i, promedio_vecinas, columna = "bruto")) %>%
+  filter(!is.na(ordenes_vec))
+
+t_ord <- t.test(pareado$ordenes_camp, pareado$ordenes_vec, paired = TRUE)
+t_bru <- t.test(pareado$bruto_camp, pareado$bruto_vec, paired = TRUE)
+w_ord <- wilcox.test(pareado$ordenes_camp, pareado$ordenes_vec, paired = TRUE)
+w_bru <- wilcox.test(pareado$bruto_camp, pareado$bruto_vec, paired = TRUE)
+
+tabla_vec <- tibble(
+  Variable = c("Órdenes por semana", "Ingreso bruto por semana"),
+  `Semanas con campaña` = c(mean(pareado$ordenes_camp), mean(pareado$bruto_camp)),
+  `Semanas vecinas sin campaña` = c(mean(pareado$ordenes_vec), mean(pareado$bruto_vec)),
+  `Diferencia %` = 100 * c(mean(pareado$ordenes_camp) / mean(pareado$ordenes_vec) - 1,
+                           mean(pareado$bruto_camp) / mean(pareado$bruto_vec) - 1),
+  `p (t pareada)` = ifelse(c(t_ord$p.value, t_bru$p.value) < 0.001, "<0.001", sprintf("%.3f", c(t_ord$p.value, t_bru$p.value))),
+  `p (Wilcoxon pareada)` = ifelse(c(w_ord$p.value, w_bru$p.value) < 0.001, "<0.001", sprintf("%.3f", c(w_ord$p.value, w_bru$p.value))))
+kable(tabla_vec, digits = 1, format.args = list(big.mark = ","))
+```
+
+**Interpretación.** Con este control, las semanas con campaña tienen `r sprintf("%.1f", tabla_vec$"Diferencia %"[1])` % de órdenes y `r sprintf("%.1f", tabla_vec$"Diferencia %"[2])` % de ingreso bruto respecto de las semanas cercanas sin campaña (`r nrow(pareado)` semanas con campaña comparadas), diferencias que **no son significativas** (p `r fp(t_ord$p.value)` y p `r fp(t_bru$p.value)`, prueba t pareada). Al comparar cada campaña con su propio entorno estacional, tampoco aparece un aumento de ventas atribuible a la promoción.
+
+# Escenario 3: ¿importa el nivel de descuento?
+
+Este análisis se hace solo con las líneas con campaña, porque son las únicas con descuento (5 % a 25 %).
+
+- H₀: no hay diferencias en el ingreso neto promedio entre los distintos niveles de descuento.
+- H₁: sí hay diferencias.
+
+También se prueba si un descuento mayor aumenta la **cantidad comprada** por línea, que es lo que debería ocurrir si el descuento funcionara.
+
+```{r e3}
+con_desc <- lineas %>%
+  filter(discount > 0) %>%
+  mutate(nivel = cut(discount, breaks = c(0, 0.0999, 0.1499, 0.1999, 0.25),
+                     labels = c("5%–9%", "10%–14%", "15%–19%", "20%–25%")))
+
+resumen_nivel <- con_desc %>%
+  group_by(nivel) %>%
+  summarise(lineas = n(), cantidad_media = mean(quantity),
+            bruto_medio = mean(subtotal), neto_medio = mean(monto_venta))
+kable(resumen_nivel, digits = 2, format.args = list(big.mark = ","))
+
+ggplot(resumen_nivel, aes(x = nivel, y = cantidad_media)) +
+  geom_col(fill = "#2C5F8A") +
+  labs(x = "Nivel de descuento", y = "Cantidad media por línea",
+       title = "Cantidad comprada según el nivel de descuento") +
+  theme_minimal()
+```
+
+```{r e3pruebas}
+kw_neto <- kruskal.test(monto_venta ~ nivel, data = con_desc)
+kw_cant <- kruskal.test(quantity ~ nivel, data = con_desc)
+kw_bruto <- kruskal.test(subtotal ~ nivel, data = con_desc)
+cor_desc <- cor.test(con_desc$discount, con_desc$quantity, method = "spearman", exact = FALSE)
+
+kw_neto
+kw_cant
+kw_bruto
+cor_desc
+```
+
+**Interpretación.** El ingreso neto por línea sí difiere entre niveles de descuento (p `r fp(kw_neto$p.value)`), por lo que se rechaza la H₀ original. Pero esa diferencia proviene del propio descuento: a mayor descuento, menor ingreso neto. Lo que importaría para la empresa es si un descuento mayor hace comprar más, y **no es así**: la cantidad por línea no cambia entre niveles (p `r fp(kw_cant$p.value)`), el ingreso bruto tampoco (p `r fp(kw_bruto$p.value)`) y la correlación entre descuento y cantidad es prácticamente nula (ρ = `r sprintf("%.3f", cor_desc$estimate)`, p `r fp(cor_desc$p.value)`). Subir el descuento de 5 % a 25 % solo reduce el ingreso neto.
+
+# Escenario 4: ¿el efecto depende de la categoría?
+
+- H₀: el efecto de las campañas sobre el ingreso es igual en todas las categorías.
+- H₁: el efecto de las campañas sobre el ingreso difiere entre categorías.
+
+Se usa un análisis de varianza con interacción sobre el ingreso bruto por línea (en escala logarítmica por su asimetría). La interacción `campana:category_name` es la que responde a la hipótesis.
+
+```{r e4anova}
+modelo_cat <- aov(log(subtotal) ~ campana * category_name, data = lineas)
+summary(modelo_cat)
+p_inter <- summary(modelo_cat)[[1]][["Pr(>F)"]][3]
+```
+
+Comparación por categoría, con el valor p ajustado por el método de Holm para no inflar el error por hacer 20 pruebas:
+
+```{r e4cat}
+por_categoria <- lineas %>%
+  group_by(category_name) %>%
+  group_modify(~ {
+    x <- .x$subtotal[.x$campana == "Con campaña"]
+    y <- .x$subtotal[.x$campana == "Sin campaña"]
+    qx <- .x$quantity[.x$campana == "Con campaña"]
+    qy <- .x$quantity[.x$campana == "Sin campaña"]
+    tibble(lineas_con_campana = length(x),
+           dif_bruto_pct = 100 * (mean(x) / mean(y) - 1),
+           p_bruto = wilcox.test(x, y)$p.value,
+           dif_cantidad_pct = 100 * (mean(qx) / mean(qy) - 1),
+           p_cantidad = wilcox.test(qx, qy)$p.value,
+           descuento_cedido = sum(.x$subtotal - .x$monto_venta))
+  }) %>%
+  ungroup() %>%
+  mutate(p_bruto_holm = p.adjust(p_bruto, "holm"),
+         p_cantidad_holm = p.adjust(p_cantidad, "holm"),
+         across(starts_with("p_"), ~ ifelse(.x < 0.001, "<0.001", sprintf("%.3f", .x)))) %>%
+  arrange(desc(descuento_cedido))
+
+kable(select(por_categoria, category_name, lineas_con_campana, dif_bruto_pct, p_bruto_holm,
+             dif_cantidad_pct, p_cantidad_holm, descuento_cedido),
+      digits = 2, format.args = list(big.mark = ","))
+```
+
+**Interpretación.** La interacción campaña × categoría es apenas significativa (p `r fp(p_inter)`) y explica una parte muy pequeña de la variación. Al comparar categoría por categoría con la corrección de Holm, **ninguna** muestra un aumento significativo del ingreso bruto ni de la cantidad vendida con campaña (el menor valor p ajustado es `r sprintf("%.3f", min(as.numeric(ifelse(por_categoria$p_bruto_holm == "<0.001", 0, por_categoria$p_bruto_holm))))`). Las diferencias observadas, de aproximadamente ±3 %, son compatibles con el azar. Formalmente la interacción permite rechazar H₀, pero su efecto práctico es mínimo y no identifica ninguna categoría donde el descuento se justifique. Las categorías que más ingreso ceden son las primeras filas de la tabla (Electronics, Toys & Games, Pet Supplies).
+
+# Escenario 5: ¿el efecto cambia según el período?
+
+- H₀: no hay diferencias en el ingreso neto promedio de las órdenes con campaña entre los períodos analizados.
+- H₁: sí hay diferencias.
+
+```{r e5}
+camp <- filter(ordenes, campana == "Con campaña")
+
+kw_anio <- kruskal.test(neto ~ factor(anio), data = camp)
+w_sem   <- wilcox.test(neto ~ factor(semestre), data = camp)
+kw_mes  <- kruskal.test(neto ~ factor(mes), data = camp)
+
+kw_anio
+w_sem
+kw_mes
+```
+
+Se compara además el efecto de la campaña sobre el ingreso bruto en cada año:
+
+```{r e5anio}
+efecto_anio <- ordenes %>%
+  group_by(anio) %>%
+  summarise(bruto_con = mean(bruto[campana == "Con campaña"]),
+            bruto_sin = mean(bruto[campana == "Sin campaña"]),
+            dif_pct = 100 * (bruto_con / bruto_sin - 1),
+            p = t.test(bruto[campana == "Con campaña"], bruto[campana == "Sin campaña"])$p.value) %>%
+  mutate(p = sprintf("%.3f", p))
+kable(mutate(efecto_anio, anio = as.character(anio)), digits = 1, format.args = list(big.mark = ","))
+```
+
+**Interpretación.** El ingreso neto de las órdenes con campaña no cambia entre años (p `r fp(kw_anio$p.value)`) ni entre semestres (p `r fp(w_sem$p.value)`): no se rechaza H₀. Entre meses aparece una diferencia leve (p `r fp(kw_mes$p.value)`), pero se trata de la tercera de tres pruebas (con corrección de Bonferroni el umbral sería 0.017) y cada mes agrupa campañas distintas, por lo que no es evidencia sólida. Tampoco hay ningún año en el que el ingreso bruto de las órdenes con campaña sea significativamente mayor que el de las órdenes sin campaña.
+
+# Modelos de regresión
+
+Siguiendo la lógica de *Model basics* de *R for Data Science*, un modelo describe el **patrón** de los datos y los **residuos** muestran lo que el modelo no explica. Aquí se usan modelos de regresión lineal para medir si las ventas dependen del descuento, igual que se estudiaría si las ventas dependen de la publicidad.
+
+## Modelo simple: ¿la cantidad comprada depende del descuento?
+
+```{r reg_simple}
+con_desc2 <- lineas %>% filter(discount > 0)
+m_desc <- lm(quantity ~ discount, data = con_desc2)
+
+coef_desc <- tidy(m_desc, conf.int = TRUE) %>% filter(term == "discount")
+kable(transmute(coef_desc, Coeficiente = estimate, `IC 95% inf` = conf.low, `IC 95% sup` = conf.high,
+                p = ifelse(p.value < 0.001, "<0.001", sprintf("%.3f", p.value))), digits = 3)
+
+medias_desc <- con_desc2 %>%
+  group_by(descuento = round(discount, 2)) %>%
+  summarise(cantidad = mean(quantity))
+
+ggplot(medias_desc, aes(x = descuento, y = cantidad)) +
+  geom_point(color = "#2C5F8A", size = 2) +
+  geom_smooth(method = "lm", se = TRUE, color = "#C0392B") +
+  scale_x_continuous(labels = percent) +
+  coord_cartesian(ylim = c(4, 7)) +
+  labs(x = "Descuento", y = "Cantidad media por línea",
+       title = "Cantidad media según el descuento (recta de regresión)") +
+  theme_minimal()
+```
+
+**Interpretación.** Por cada 10 puntos porcentuales más de descuento, la cantidad por línea cambia en `r sprintf("%.2f", coef_desc$estimate * 0.10)` unidades (IC 95 %: `r sprintf("%.2f", coef_desc$conf.low * 0.10)` a `r sprintf("%.2f", coef_desc$conf.high * 0.10)`; p `r fp(coef_desc$p.value)`), y el modelo explica el `r sprintf("%.4f", summary(m_desc)$r.squared * 100)` % de la variación. La pendiente es prácticamente cero: **un descuento mayor no hace comprar más**.
+
+## Modelo del ingreso por orden, controlando año y mes
+
+Se estima el efecto de la campaña sobre el ingreso, controlando por año y mes. Se usa el logaritmo del ingreso, de modo que el coeficiente se interpreta como un cambio porcentual: `exp(coef) − 1`.
+
+```{r regresion}
+m_bruto <- lm(log(bruto) ~ campana + factor(anio) + factor(mes), data = ordenes)
+m_neto  <- lm(log(neto)  ~ campana + factor(anio) + factor(mes), data = ordenes)
+
+resultado <- bind_rows(
+  tidy(m_bruto, conf.int = TRUE) %>% filter(grepl("^campana", term)) %>% mutate(modelo = "log(ingreso bruto)"),
+  tidy(m_neto,  conf.int = TRUE) %>% filter(grepl("^campana", term)) %>% mutate(modelo = "log(ingreso neto)")) %>%
+  transmute(modelo,
+            `efecto %` = 100 * (exp(estimate) - 1),
+            `IC 95% inf` = 100 * (exp(conf.low) - 1),
+            `IC 95% sup` = 100 * (exp(conf.high) - 1),
+            p = ifelse(p.value < 0.001, "<0.001", sprintf("%.3f", p.value)))
+kable(resultado, digits = 2)
+```
+
+R² del modelo del ingreso bruto: `r round(summary(m_bruto)$r.squared, 4)`; del ingreso neto: `r round(summary(m_neto)$r.squared, 4)`.
+
+**Interpretación.** El efecto de la campaña sobre el ingreso **bruto** mide el aumento real de ventas atribuible a la promoción: `r sprintf("%.1f", resultado$"efecto %"[1])` % (IC 95 %: `r sprintf("%.1f", resultado$"IC 95% inf"[1])` % a `r sprintf("%.1f", resultado$"IC 95% sup"[1])` %), **no significativo**. El efecto sobre el ingreso **neto** mide lo que realmente recibe la empresa: `r sprintf("%.1f", resultado$"efecto %"[2])` %. La diferencia entre ambos es el costo del descuento. El R² es muy bajo en ambos modelos porque el valor de una orden depende sobre todo de los productos que contiene, no del año, el mes o la campaña.
+
+
+## ¿Qué explica el valor de una línea de venta?
+
+Se comparan modelos para el logaritmo del ingreso bruto por línea, para ver qué variable explica más.
+
+```{r reg_comparar}
+modelos <- list(
+  "Solo campaña"        = lm(log(subtotal) ~ campana, data = lineas),
+  "Solo descuento"      = lm(log(subtotal) ~ discount, data = lineas),
+  "Solo año y mes"      = lm(log(subtotal) ~ factor(anio) + factor(mes), data = lineas),
+  "Solo categoría"      = lm(log(subtotal) ~ category_name, data = lineas),
+  "Categoría + campaña" = lm(log(subtotal) ~ category_name + campana, data = lineas))
+
+tabla_r2 <- tibble(Modelo = names(modelos),
+                   `R² (%)` = 100 * sapply(modelos, function(m) summary(m)$r.squared),
+                   `R² ajustado (%)` = 100 * sapply(modelos, function(m) summary(m)$adj.r.squared))
+kable(tabla_r2, digits = 3)
+
+a_camp <- anova(modelos[["Solo categoría"]], modelos[["Categoría + campaña"]])
+p_camp_extra <- a_camp$`Pr(>F)`[2]
+```
+
+**Interpretación.** La variable que más explica el valor de una línea es la **`r tolower(tabla_r2$Modelo[1:4][which.max(tabla_r2$"R² (%)"[1:4])])`** (R² de `r sprintf("%.2f", max(tabla_r2$"R² (%)"[1:4]))` %), y aun así explica muy poco: el valor de una línea depende sobre todo de la cantidad y del precio de cada producto. La campaña y el descuento explican prácticamente nada. Al agregar la campaña al modelo de categoría, la mejora `r ifelse(p_camp_extra < 0.05, "es significativa", "no es significativa")` (p `r fp(p_camp_extra)`).
+
+## Diagnóstico de los residuos
+
+Se revisan los residuos del modelo del ingreso bruto por orden (muestra de 5,000 órdenes para que los gráficos sean legibles).
+
+```{r residuos}
+set.seed(123)
+aug <- data.frame(.fitted = fitted(m_bruto), .resid = resid(m_bruto)) %>% slice_sample(n = 5000)
+
+ggplot(aug, aes(x = .fitted, y = .resid)) +
+  geom_point(alpha = 0.3, color = "#2C5F8A") +
+  geom_hline(yintercept = 0, color = "#C0392B") +
+  labs(x = "Valor ajustado", y = "Residuo", title = "Residuos frente a valores ajustados") +
+  theme_minimal()
+
+ggplot(aug, aes(sample = .resid)) +
+  stat_qq(alpha = 0.3, color = "#2C5F8A") +
+  stat_qq_line(color = "#C0392B") +
+  labs(x = "Cuantiles teóricos", y = "Cuantiles de los residuos", title = "Gráfico Q-Q de los residuos") +
+  theme_minimal()
+```
+
+**Interpretación.** Los residuos no siguen una tendencia según el valor ajustado, pero **no son normales**: tienen una cola larga hacia valores negativos, que corresponde a órdenes de valor muy bajo (el gráfico Q-Q se aparta de la recta). Por eso, además de la prueba t, los contrastes de este informe se respaldan con pruebas no paramétricas. Los valores ajustados casi no varían (el modelo explica muy poco), así que estos modelos sirven para **comparar** el nivel medio entre campañas, años y meses, no para predecir el valor de una orden concreta.
+
+## Modelo semanal: ¿las ventas de la semana dependen de la campaña?
+
+Es el equivalente a preguntar si las ventas dependen de la publicidad. Se modela el número de órdenes y el ingreso bruto de cada semana según si hubo campaña, controlando la tendencia en el tiempo (`i` es el número de semana).
+
+```{r reg_semanal}
+m_sem_ord <- lm(ordenes ~ campana + i, data = sem_ord)
+m_sem_bru <- lm(bruto ~ campana + i, data = sem_ord)
+
+coef_sem <- bind_rows(
+  tidy(m_sem_ord, conf.int = TRUE) %>% filter(grepl("^campana", term)) %>% mutate(modelo = "Órdenes por semana"),
+  tidy(m_sem_bru, conf.int = TRUE) %>% filter(grepl("^campana", term)) %>% mutate(modelo = "Ingreso bruto por semana")) %>%
+  transmute(modelo, `Efecto de la campaña` = estimate, `IC 95% inf` = conf.low, `IC 95% sup` = conf.high,
+            p = ifelse(p.value < 0.001, "<0.001", sprintf("%.3f", p.value)))
+kable(coef_sem, digits = 1, format.args = list(big.mark = ","))
+```
+
+**Interpretación.** Tener campaña en la semana cambia el número de órdenes en `r sprintf("%.1f", coef_sem$"Efecto de la campaña"[1])` (IC 95 %: `r sprintf("%.1f", coef_sem$"IC 95% inf"[1])` a `r sprintf("%.1f", coef_sem$"IC 95% sup"[1])`) y el ingreso bruto semanal en `r format(round(coef_sem$"Efecto de la campaña"[2]), big.mark = ",")`, diferencias que se comparan con un promedio de `r round(mean(sem_ord$ordenes))` órdenes y `r format(round(mean(sem_ord$bruto)), big.mark = ",")` de ingreso bruto por semana. No se observa que la campaña eleve las ventas semanales.
+
+# Extensión: tiempo hasta la siguiente compra (análisis de supervivencia)
+
+El archivo de ejemplo del curso se titulaba "Análisis de supervivencia". Aquí se aplica ese método: el **evento** es que el cliente realice su siguiente compra y el **tiempo** son los días desde la orden hasta la siguiente. La última orden de cada cliente es un dato censurado, porque no se observa su siguiente compra.
+
+```{r superv}
+fin_estudio <- max(orders$order_date)
+
+sup <- orders %>%
+  arrange(customer_id, order_date, order_id) %>%
+  group_by(customer_id) %>%
+  mutate(siguiente = lead(order_date)) %>%
+  ungroup() %>%
+  mutate(evento = as.integer(!is.na(siguiente)),
+         dias = as.numeric(coalesce(siguiente, fin_estudio) - order_date),
+         campana = factor(ifelse(is.na(campaign_id), "Sin campaña", "Con campaña"),
+                          levels = c("Sin campaña", "Con campaña")))
+
+km <- survfit(Surv(dias, evento) ~ campana, data = sup)
+print(km, print.rmean = TRUE)
+
+plot(km, col = c("#2C5F8A", "#C0392B"), lwd = 2, xlim = c(0, 120),
+     xlab = "Días desde la orden", ylab = "Probabilidad de no haber vuelto a comprar",
+     main = "Kaplan-Meier: tiempo hasta la siguiente compra")
+legend("topright", legend = levels(sup$campana), col = c("#2C5F8A", "#C0392B"), lwd = 2, bty = "n")
+
+survdiff(Surv(dias, evento) ~ campana, data = sup)
+```
+
+```{r cox}
+cox <- coxph(Surv(dias, evento) ~ campana + cluster(customer_id), data = sup)
+summary(cox)
+
+hr <- exp(coef(cox))
+hr_ic <- summary(cox)$conf.int[1, c("lower .95", "upper .95")]
+p_cox <- summary(cox)$coefficients[1, "Pr(>|z|)"]
+mediana <- summary(km)$table[, "median"]
+```
+
+**Interpretación.** La mediana del tiempo hasta la siguiente compra es de `r mediana[1]` días después de una orden sin campaña y de `r mediana[2]` días después de una orden con campaña. La razón de riesgo es `r sprintf("%.3f", hr)` (IC 95 %: `r sprintf("%.3f", hr_ic[1])` a `r sprintf("%.3f", hr_ic[2])`; p `r fp(p_cox)`), prácticamente 1: el cliente vuelve a comprar al mismo ritmo con o sin campaña, así que el descuento **no acelera la recompra**. Como cada cliente tiene muchas órdenes, el modelo de Cox usa errores estándar robustos agrupados por cliente.
+
+# Conclusiones
+
+```{r conclusiones, echo=FALSE}
+cat("Resumen de los resultados principales\n\n")
+resumen_final <- tibble(
+  Medida = c("Descuento promedio en órdenes con campaña",
+             "Aumento de ingreso bruto necesario para compensar",
+             "Diferencia del ingreso bruto por orden (con vs sin campaña)",
+             "Diferencia en órdenes por semana (con vs sin campaña)",
+             "Diferencia en unidades por orden (con vs sin campaña)",
+             "Descuento total cedido (millones)"),
+  Valor = c(percent(d, accuracy = 0.1),
+            percent(aumento_requerido, accuracy = 0.1),
+            sprintf("%.1f%%", e1$`Diferencia %`[2]),
+            sprintf("%.1f%%", e2s$`Diferencia %`[1]),
+            sprintf("%.1f%%", e2$`Diferencia %`[1]),
+            sprintf("%.1f", (sum(lineas$subtotal) - sum(lineas$monto_venta)) / 1e6)))
+kable(resumen_final)
+```
+
+1. **Las campañas no compensan el descuento.** Para recuperar el ingreso cedido, las ventas brutas tendrían que aumentar alrededor de 17.5 %, y el aumento observado es nulo o negativo.
+2. **El descuento no incrementa las cantidades.** No hay más unidades, líneas ni órdenes en las semanas de campaña, y un descuento mayor no hace comprar más.
+3. **Ninguna categoría ni período muestra un efecto que justifique la inversión.** Tras la corrección de Holm, ninguna categoría aumenta su ingreso bruto ni sus unidades con campaña, y el ingreso de las órdenes con campaña no cambia por año ni semestre.
+4. **Los clientes no compran antes por una campaña.** El tiempo hasta la siguiente compra es igual con y sin campaña (razón de riesgo cercana a 1).
+5. **Escenario respaldado:** la evidencia respalda el **Escenario 3** (las campañas no generan un aumento significativo de ventas). No respalda el Escenario 1 (aumento rentable) ni el Escenario 2 (aumentan las ventas pero no compensan), porque no hay aumento de ventas.
+6. **La categoría explica las diferencias de ventas, pero no la respuesta al descuento.** En el análisis exploratorio la categoría es la variable que más separa las ventas, pero ninguna categoría responde mejor a las campañas (Escenario 4).
+7. **Decisión para las fases siguientes:** reducir o rediseñar las campañas. En la Fase 4 se calcula el impacto financiero del descuento cedido (32.8 millones), y en la Fase 5 se optimiza la asignación de la inversión promocional.
+
+## Limitaciones
+
+- No hay costos, por lo que no se puede medir rentabilidad.
+- Las campañas se asignan por semana del año, así que su efecto se confunde con la estacionalidad de esa semana.
+- Los datos son de un solo comercio y el análisis es observacional, no experimental.
+
+## Referencias
+
+- Wickham, H. y Grolemund, G. (2017). *R for Data Science*. O'Reilly. Capítulo 7, *Exploratory Data Analysis*: https://r4ds.had.co.nz/exploratory-data-analysis.html
+- Wickham, H. y Grolemund, G. (2017). *R for Data Science*. O'Reilly. Capítulo 23, *Model basics*: https://r4ds.had.co.nz/model-basics.html
+- Posit. *Cheatsheets*: https://rstudio.github.io/cheatsheets/
+- SQL Server Central. *How to work with RStudio and SQL Server*: https://www.sqlservercentral.com/articles/how-to-work-with-rstudio-and-sql-server
